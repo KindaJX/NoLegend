@@ -20,6 +20,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -47,6 +48,10 @@ LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scan_histor
 
 # 每档固定买入份数
 N_PER_BUCKET = 10
+
+# Taker 返佣率（按用户当前阶位设置）
+# 白银（Silver）：8%，参考 https://docs.polymarket.com/programs/taker-rebates
+TAKER_REBATE_RATE = 0.08
 # 子块最大跨度（档位个数）。
 # 实测 weather tag 下温度盘（日最高/最低温）几乎全部为 11 档
 # （如上海 8/14: 24及以下,25,26,27,28,29,30,31,32,33,34及以上），
@@ -74,35 +79,27 @@ MAX_RANGE_BY_TAG = {
 MIN_RANGE = 2
 
 # 默认扫描的标的类型：tag_slug -> 名称
-# weather 一个 tag 即聚合了 weather 页面上所有天气市场（温度/降水/飓风/龙卷风/
-# 地震/全球/大流行等）。其中二元 yes/no 盘（1 档）会被 MIN_RANGE 过滤 pass，
-# 多档分区盘（如 daily-temperature、precipitation、hurricanes、tornadoes、
-# earthquakes、global 等）则进入套利扫描。分页拉全可覆盖全部交易日（t+0/t+1/t+2）。
-#
-# 经济数据 tag（cpi/gdp/fed/interest-rates/unemployment/inflation/macro-indicators）
-# 与选举（election）、地震（earthquake）实测具有同样的多档互斥分区结构，
-# 且 NO 侧卖单流动性良好（抽样 6/6 ~ 8/8 档有卖单），可直接复用同一套
-# NO 不败子块扫描逻辑。档位数多在 4~23 之间，MAX_RANGE=11 可覆盖大部分；
-# 若出现更高档数事件，可在发现后按需上调或为该类单独配置。
+# 当前仅扫描温度相关市场（最高温/最低温），
+# 在 discover_events 中用 _weather_kind 过滤，只保留"温度最高"/"温度最低"，
+# 降水、飓风、地震等非温度事件被排除。
 CATEGORIES = {
-    "weather": "天气（全部）",
-    "cpi": "CPI 通胀",
-    "gdp": "GDP",
-    "fed": "美联储/FOMC",
-    "interest-rates": "利率",
-    "unemployment": "失业率",
-    "inflation": "通胀",
-    "macro-indicators": "宏观指标",
-    "election": "选举",
-    "earthquake": "地震",
+    "weather": "天气（温度）",
 }
 
 _HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 _session = requests.Session()
 _session.headers.update(_HEADERS)
-# 本机走代理访问 Polymarket（直连超时）；可通过环境变量 POLY_PROXY 覆盖
-_proxy = os.environ.get("POLY_PROXY", "http://127.0.0.1:7897")
-_session.proxies.update({"http": _proxy, "https": _proxy})
+
+# 多线程打印锁 + 运行状态追踪（用于每小时健康报告 + 错误通知）
+_print_lock = threading.Lock()
+_scan_stats = {
+    "scan_count": 0, "event_count": 0, "opportunities": 0,
+    "errors": 0, "api_errors": 0, "last_hour_ts": 0.0,
+}
+# 可通过环境变量 POLY_PROXY 配置代理（如 http://127.0.0.1:7897），默认不代理
+_proxy = os.environ.get("POLY_PROXY")
+if _proxy:
+    _session.proxies.update({"http": _proxy, "https": _proxy})
 
 
 def _get_json(url, params=None, retries=3):
@@ -155,6 +152,10 @@ def discover_events(categories=None):
                     pass
             # 不在此按档位数提前过滤：全量纳入（含二元盘），
             # 二元盘是否抛弃交由 scan_event 在扫描阶段判定，保证每次扫最新、不因形态漏扫。
+            # 只保留温度相关的天气事件（最高温/最低温）
+            kind = _weather_kind(ev)
+            if kind not in ("温度最高", "温度最低"):
+                continue
             events.append({"event": ev, "category": name, "tag_slug": tag})
     return events
 
@@ -395,10 +396,16 @@ def simulate_order(res, N=N_PER_BUCKET):
         块外回款/收益/ROI 一律置 0，调用方据此显示"无块外选项"。
 
     手续费（官方公式 fee = C × feeRate × p × (1-p)，USDC）：
-      - 每档手续费 = N × rate_i × p_i × (1 - p_i)，p_i = 该档 NO 卖一价
-      - 总手续费 = Σ 每档手续费（美分计）
-      - 手续费后收益 = 原净赚 - 总手续费；手续费后收益率 = 手续费后收益 / 总投入
-      - 块内/块外两种情形都算，作为原收益的补充字段（不替代原收益）。
+	      - 每档手续费 = N × rate_i × p_i × (1 - p_i)，p_i = 该档 NO 卖一价
+	      - 总手续费 = Σ 每档手续费（美分计）
+	      - 手续费后收益 = 原净赚 - 总手续费；手续费后收益率 = 手续费后收益 / 总投入
+	      - 块内/块外两种情形都算，作为原收益的补充字段（不替代原收益）。
+
+	    Taker 返佣（参考 https://docs.polymarket.com/programs/taker-rebates）：
+	      - 返佣金额 = 总手续费 × TAKER_REBATE_RATE（白银阶 = 8%）
+	      - 含返佣后收益 = 手续费后收益 + 返佣金额
+	      - 含返佣后收益率 = 含返佣后收益 / 总投入
+	      - 返佣每日 UTC 零点以 pUSD 发放，此处按理论值计算。
     """
     cost_cents = res["sum_no_cents"] * N
     k = res["k"]
@@ -437,6 +444,12 @@ def simulate_order(res, N=N_PER_BUCKET):
         "outer_profit_after_fee": outer_profit - fee_cents,  # 手续费后块外净赚
         "inner_roi_after_fee": (inner_profit - fee_cents) / cost_cents,
         "outer_roi_after_fee": (outer_profit - fee_cents) / cost_cents if outer_payout > 0 else 0.0,
+        # ---- Taker 返佣补充字段 ----
+        "rebate_cents": fee_cents * TAKER_REBATE_RATE,  # 返佣金额（美分）= 手续费 × 返佣率
+        "inner_profit_with_rebate": inner_profit - fee_cents + fee_cents * TAKER_REBATE_RATE,  # 含返佣的块内净赚
+        "outer_profit_with_rebate": outer_profit - fee_cents + fee_cents * TAKER_REBATE_RATE,  # 含返佣的块外净赚
+        "inner_roi_with_rebate": (inner_profit - fee_cents + fee_cents * TAKER_REBATE_RATE) / cost_cents,
+        "outer_roi_with_rebate": (outer_profit - fee_cents + fee_cents * TAKER_REBATE_RATE) / cost_cents if outer_payout > 0 else 0.0,
     }
 
 
@@ -474,6 +487,12 @@ def render(res, sim):
     print(f"    手续费后（块内）收益率 = {sim['inner_roi_after_fee']*100:.2f}%  （收益：{fmt_cents(sim['inner_profit_after_fee'])}）")
     if not sim['is_full']:
         print(f"    手续费后（块外）收益率 = {sim['outer_roi_after_fee']*100:.2f}%  （收益：{fmt_cents(sim['outer_profit_after_fee'])}）")
+    # Taker 返佣（追加）
+    print(f"    --- Taker 返佣（白银阶 {TAKER_REBATE_RATE*100:.0f}%）---")
+    print(f"    返佣金额 = {fmt_cents(sim['rebate_cents'])}  返佣收益率 = {sim['rebate_cents']/sim['cost_cents']*100:.2f}%")
+    print(f"    含返佣后（块内）收益率 = {sim['inner_roi_with_rebate']*100:.2f}%  （收益：{fmt_cents(sim['inner_profit_with_rebate'])}）")
+    if not sim['is_full']:
+        print(f"    含返佣后（块外）收益率 = {sim['outer_roi_with_rebate']*100:.2f}%  （收益：{fmt_cents(sim['outer_profit_with_rebate'])}）")
 
 
 # ---------------------------------------------------------------
@@ -530,6 +549,22 @@ def build_card(res, sim):
     else:
         fee_str += "手续费后（块外）：**无（全仓买入所有档位）**"
     sections.append(fee_str)
+    # Taker 返佣（追加）
+    rebate_str = (
+        f"**Taker 返佣（白银阶 {TAKER_REBATE_RATE*100:.0f}%）**\n"
+        f"返佣金额 = **{fmt_cents(sim['rebate_cents'])}**"
+        f"（返佣收益率 = **{sim['rebate_cents']/sim['cost_cents']*100:.2f}%**）\n"
+        f"含返佣后（块内）收益率 = **{sim['inner_roi_with_rebate']*100:.2f}%**"
+        f"（收益：**{fmt_cents(sim['inner_profit_with_rebate'])}**）\n"
+    )
+    if not sim['is_full']:
+        rebate_str += (
+            f"含返佣后（块外）收益率 = **{sim['outer_roi_with_rebate']*100:.2f}%**"
+            f"（收益：**{fmt_cents(sim['outer_profit_with_rebate'])}**）"
+        )
+    else:
+        rebate_str += "含返佣后（块外）：**无（全仓买入所有档位）**"
+    sections.append(rebate_str)
     elements = [{"tag": "markdown", "content": sec} for sec in sections]
     return {
         "msg_type": "interactive",
@@ -576,6 +611,63 @@ def send_lark(text):
         return False
 
 
+def send_lark_error(msg):
+    """发送错误文本到飞书机器人，用于通知 API 限频/超时等异常。"""
+    text = f"⚠️ [NO 不败扫描器] 异常告警\n{msg}"
+    return send_lark(text)
+
+
+def send_lark_health_report(stats, elapsed):
+    """每小时发送一次运行健康报告。"""
+    now_str = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    uptime = stats["scan_count"]
+    text = (
+        f"✅ [NO 不败扫描器] 运行健康报告\n"
+        f"时间：{now_str}\n"
+        f"累计扫描轮次：{uptime}\n"
+        f"最近一轮扫描事件：{stats['event_count']} 个 ｜ 命中：{stats['opportunities']} 个\n"
+        f"最近一轮耗时：{elapsed:.1f} 秒\n"
+        f"累计异常：{stats['errors']} 次 ｜ API 错误：{stats['api_errors']} 次\n"
+        f"状态：{'正常' if stats['errors'] < 3 else '请关注'}"
+    )
+    return send_lark(text)
+
+
+def safe_print(*args, **kwargs):
+    """线程安全的 print，避免多线程输出交错。"""
+    with _print_lock:
+        print(*args, **kwargs)
+
+
+def _check_hourly_report(scan_elapsed):
+    """检查是否到达整点，发送健康报告并重置统计。"""
+    now = time.time()
+    if now - _scan_stats["last_hour_ts"] >= 3600:
+        _scan_stats["last_hour_ts"] = now
+        send_lark_health_report(_scan_stats, scan_elapsed)
+        _scan_stats["scan_count"] = 0
+        _scan_stats["event_count"] = 0
+        _scan_stats["opportunities"] = 0
+        _scan_stats["errors"] = 0
+        _scan_stats["api_errors"] = 0
+
+
+def _rotate_log(path, max_bytes=10_485_760):
+    """日志文件超过 max_bytes（默认 10MB）时轮转，保留最近 5 份。"""
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > max_bytes:
+            dirname = os.path.dirname(path)
+            basename = os.path.basename(path)
+            for i in range(4, 0, -1):
+                old = os.path.join(dirname, f"{basename}.{i}")
+                new = os.path.join(dirname, f"{basename}.{i + 1}")
+                if os.path.exists(old):
+                    os.replace(old, new)
+            os.replace(path, os.path.join(dirname, f"{basename}.1"))
+    except Exception:
+        pass
+
+
 def write_log(res, sim, notify_ok=None):
     """把本次扫描结果追加到本地日志文件。"""
     ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -596,9 +688,14 @@ def write_log(res, sim, notify_ok=None):
                      f"块内净赚 {fmt_cents(sim['inner_profit_cents'])} | 块外净赚 {fmt_cents(sim['outer_profit_cents'])}")
     lines.append(f"  手续费: {fmt_cents(sim['fee_cents'])} | 手续费后块内净赚 {fmt_cents(sim['inner_profit_after_fee'])}"
                  + ("" if sim.get("is_full") else f" | 手续费后块外净赚 {fmt_cents(sim['outer_profit_after_fee'])}"))
+    lines.append(f"  Taker返佣(白银阶{TAKER_REBATE_RATE*100:.0f}%): 返佣金额 {fmt_cents(sim['rebate_cents'])} | "
+                 f"返佣收益率 {sim['rebate_cents']/sim['cost_cents']*100:.2f}%"
+                 f" | 含返佣块内收益率 {sim['inner_roi_with_rebate']*100:.2f}%"
+                 + ("" if sim.get("is_full") else f" | 含返佣块外收益率 {sim['outer_roi_with_rebate']*100:.2f}%"))
     if notify_ok is not None:
         lines.append(f"  飞书通知: {'成功' if notify_ok else '失败'}")
     try:
+        _rotate_log(LOG_FILE)
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
     except Exception as e:
@@ -667,61 +764,163 @@ def _print_candidate_summary(events):
 
 
 def main():
-    t_start = time.perf_counter()
-    verbose = "--verbose" in sys.argv
-    print("正在发现分区市场事件 ...")
-    events = discover_events()
-    _print_candidate_summary(events)
+    import argparse
+    parser = argparse.ArgumentParser(description="Polymarket 温度市场 NO 不败套利扫描器")
+    parser.add_argument("--verbose", "-v", action="store_true", help="显示未命中的最接近组合")
+    parser.add_argument("--loop", "-l", action="store_true", help="连续轮扫模式")
+    parser.add_argument("--interval", "-i", type=int, default=30,
+                        help="轮扫间隔秒数（默认 30 秒，仅 --loop 时生效）")
+    parser.add_argument("--workers", "-w", type=int, default=8,
+                        help="事件级并发数（默认 8）")
+    args = parser.parse_args()
+    verbose = args.verbose
 
-    opportunities = 0
-    subset_count = 0
-    full_count = 0
-    total_possible = 0
-    total_evaluated = 0
-    for ev_info in events:
-        # 按 tag 取子块上限，未配置的走默认 MAX_RANGE
-        max_range = MAX_RANGE_BY_TAG.get(ev_info.get("tag_slug"), MAX_RANGE)
-        res = scan_event(ev_info, max_range=max_range)
-        if res is None:
-            continue
-        total_possible += res.get("combos_possible", 0)
-        total_evaluated += res.get("combos_evaluated", 0)
-        best = res.get("best")
-        if best is not None:
-            sim = simulate_order(best)
-            opportunities += 1
-            # 真子组合判定：买入档数 k < 市场总档位数 n
-            n_total = len(res.get("bucketed", []))
-            if best["k"] < n_total:
-                subset_count += 1
-            else:
-                full_count += 1
-            render(best, sim)
-            # 飞书通知（交互式卡片，绿色大标题）+ 本地日志
-            notify_ok = send_lark_card(build_card(best, sim))
-            write_log(best, sim, notify_ok)
-        elif verbose and res.get("nearest"):
-            near = res["nearest"]
-            print("-" * 72)
-            print(f"[{near['category']}] {near['event'].get('title')}  "
-                  f"(slug={near['event'].get('slug')})")
-            print(f"  未满足条件，最接近的组合 k={near['k']}，"
-                  f"Σno={near['sum_no_cents']:.1f} 美分 vs 门槛 {near['threshold_cents']:.0f} 美分，"
-                  f"还差 {near['gap_cents']:.1f} 美分  ✗")
+    EVENT_WORKERS = args.workers
 
-    if opportunities == 0:
-        print("未扫描到满足 NO 不败条件 (Σno <= k-1) 的组合。")
-        if verbose:
-            print("（已列出各事件中最接近门槛的组合，供观察市场倒挂程度）")
-    t_elapsed = time.perf_counter() - t_start
-    print(f"\n扫描完成，共发现 {opportunities} 个符合规则的市场标的。")
-    subset_pct = (subset_count / opportunities * 100) if opportunities else 0.0
-    print(f"  其中 真子组合（未买全档，k<n）: {subset_count} 个，占 {subset_pct:.1f}%")
-    print(f"        全仓组合（k=n 买全档）  : {full_count} 个，占 {100.0 - subset_pct:.1f}%")
-    print(f"本次扫描耗时：{t_elapsed:.2f} 秒（共扫描 {len(events)} 个事件）")
-    print(f"子块组合统计：理论上限 {total_possible} 种，实际完整评估 {total_evaluated} 种"
-          f"（含无卖单档位被截断的未评估组合）")
-    _write_run_log(events, opportunities, t_elapsed, total_possible, total_evaluated)
+    def run_one_scan():
+        t_start = time.perf_counter()
+        safe_print("正在发现分区市场事件 ...")
+        events = discover_events()
+        _print_candidate_summary(events)
+
+        opportunities = 0
+        subset_count = 0
+        full_count = 0
+        total_possible = 0
+        total_evaluated = 0
+        errors = 0
+        api_errors = 0
+
+        # 工具：线程安全地累加计数器
+        cnt_lock = threading.Lock()
+        def add_stats(**kw):
+            nonlocal opportunities, subset_count, full_count, total_possible, total_evaluated, errors, api_errors
+            with cnt_lock:
+                for k, v in kw.items():
+                    if k == "opportunities": opportunities += v
+                    elif k == "subset": subset_count += v
+                    elif k == "full": full_count += v
+                    elif k == "possible": total_possible += v
+                    elif k == "evaluated": total_evaluated += v
+                    elif k == "errors": errors += v
+                    elif k == "api_errors": api_errors += v
+
+        def process_event(ev_info):
+            """处理单个事件，返回(命中标记, 组合数统计)或None。"""
+            max_range = MAX_RANGE_BY_TAG.get(ev_info.get("tag_slug"), MAX_RANGE)
+            try:
+                res = scan_event(ev_info, max_range=max_range)
+            except Exception as e:
+                safe_print(f"[error] 扫描事件异常: {ev_info['event'].get('title')}: {e}")
+                return {"error": True}
+            if res is None:
+                return {"skip": True}
+            out = {"possible": res.get("combos_possible", 0), "evaluated": res.get("combos_evaluated", 0)}
+            best = res.get("best")
+            if best is not None:
+                sim = simulate_order(best)
+                n_total = len(res.get("bucketed", []))
+                is_subset = best["k"] < n_total
+                with _print_lock:
+                    render(best, sim)
+                # 只通知返佣后收益为正的标的
+                has_rebate_profit = (
+                    sim["inner_profit_with_rebate"] > 0 or
+                    sim["outer_profit_with_rebate"] > 0
+                )
+                if has_rebate_profit:
+                    notify_ok = send_lark_card(build_card(best, sim))
+                else:
+                    notify_ok = False
+                write_log(best, sim, notify_ok)
+                out.update({"hit": True, "is_subset": is_subset})
+            elif verbose and res.get("nearest"):
+                near = res["nearest"]
+                with _print_lock:
+                    print("-" * 72)
+                    print(f"[{near['category']}] {near['event'].get('title')}  "
+                          f"(slug={near['event'].get('slug')})")
+                    print(f"  未满足条件，最接近的组合 k={near['k']}，"
+                          f"Σno={near['sum_no_cents']:.1f} 美分 vs 门槛 {near['threshold_cents']:.0f} 美分，"
+                          f"还差 {near['gap_cents']:.1f} 美分  ✗")
+            return out
+
+        # 事件级并行扫描
+        with ThreadPoolExecutor(max_workers=EVENT_WORKERS) as ex:
+            futs = {ex.submit(process_event, ev_info): ev_info for ev_info in events}
+            for f in as_completed(futs):
+                ev_info = futs[f]
+                try:
+                    result = f.result()
+                except Exception as e:
+                    safe_print(f"[error] 事件处理异常: {ev_info['event'].get('title')}: {e}")
+                    add_stats(errors=1)
+                    continue
+                if result is None:
+                    continue
+                if result.get("error"):
+                    add_stats(errors=1, api_errors=1)
+                    send_lark_error(f"扫描事件异常: {ev_info['event'].get('title')}")
+                    continue
+                if result.get("skip"):
+                    continue
+                add_stats(
+                    possible=result.get("possible", 0),
+                    evaluated=result.get("evaluated", 0),
+                )
+                if result.get("hit"):
+                    add_stats(opportunities=1, subset=1 if result.get("is_subset") else 0,
+                              full=0 if result.get("is_subset") else 1)
+
+        if opportunities == 0:
+            safe_print("未扫描到满足 NO 不败条件 (Σno <= k-1) 的组合。")
+            if verbose:
+                safe_print("（已列出各事件中最接近门槛的组合，供观察市场倒挂程度）")
+        t_elapsed = time.perf_counter() - t_start
+        safe_print(f"\n扫描完成，共发现 {opportunities} 个符合规则的市场标的。")
+        subset_pct = (subset_count / opportunities * 100) if opportunities else 0.0
+        safe_print(f"  其中 真子组合（未买全档，k<n）: {subset_count} 个，占 {subset_pct:.1f}%")
+        safe_print(f"        全仓组合（k=n 买全档）  : {full_count} 个，占 {100.0 - subset_pct:.1f}%")
+        safe_print(f"本次扫描耗时：{t_elapsed:.2f} 秒（共扫描 {len(events)} 个事件）")
+        safe_print(f"子块组合统计：理论上限 {total_possible} 种，实际完整评估 {total_evaluated} 种"
+              f"（含无卖单档位被截断的未评估组合）")
+        _write_run_log(events, opportunities, t_elapsed, total_possible, total_evaluated)
+
+        # 更新全局统计（用于每小时健康报告）
+        _scan_stats["scan_count"] += 1
+        _scan_stats["event_count"] = len(events)
+        _scan_stats["opportunities"] = opportunities
+        _scan_stats["errors"] += errors
+        _scan_stats["api_errors"] += api_errors
+        if errors > 0:
+            send_lark_error(f"本轮扫描异常 {errors} 次（API 错误 {api_errors} 次）")
+
+        return t_elapsed
+
+    # 单次扫描
+    first_elapsed = run_one_scan()
+    _scan_stats["last_hour_ts"] = time.time()
+
+    if args.loop:
+        safe_print(f"\n进入连续轮扫模式，间隔 {args.interval} 秒，并发 {EVENT_WORKERS} 事件 ...")
+        safe_print("=" * 72)
+        _check_hourly_report(first_elapsed)
+        while True:
+            wait = args.interval
+            for remaining in range(wait, 0, -1):
+                safe_print(f"\r下次扫描倒计时 {remaining} 秒 ...", end="", flush=True)
+                time.sleep(1)
+            safe_print("\r" + " " * 50 + "\r", end="")
+            safe_print(f"\n{'='*72}")
+            safe_print(f"轮扫: {datetime.now(timezone.utc).astimezone().strftime('%Y-%m-%d %H:%M:%S')}")
+            safe_print("=" * 72)
+            try:
+                elapsed = run_one_scan()
+            except Exception as e:
+                safe_print(f"[error] 轮扫异常: {e}")
+                send_lark_error(f"轮扫异常: {e}")
+                elapsed = 0
+            _check_hourly_report(elapsed)
 
 
 def _write_run_log(events, opportunities, elapsed, combos_possible=0, combos_evaluated=0):
@@ -732,6 +931,7 @@ def _write_run_log(events, opportunities, elapsed, combos_possible=0, combos_eva
             f"组合 {combos_evaluated}/{combos_possible} 种评估 | "
             f"耗时 {elapsed:.2f} 秒")
     try:
+        _rotate_log(runfile)
         with open(runfile, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception as e:
