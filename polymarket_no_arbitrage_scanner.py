@@ -823,13 +823,13 @@ def main():
                 is_subset = best["k"] < n_total
                 with _print_lock:
                     render(best, sim)
-                # 只通知返佣后收益为正的标的
-                has_rebate_profit = (
-                    sim["inner_profit_with_rebate"] > 0 or
-                    sim["outer_profit_with_rebate"] > 0
-                )
-                if has_rebate_profit:
-                    notify_ok = send_lark_card(build_card(best, sim))
+                # 只推送手续费后收益为正的标的
+	                has_positive_profit = (
+	                    sim["inner_profit"] > 0 or
+	                    sim["outer_profit"] > 0
+	                )
+	                if has_positive_profit:
+	                    notify_ok = send_lark_card(build_card(best, sim))
                 else:
                     notify_ok = False
                 write_log(best, sim, notify_ok)
